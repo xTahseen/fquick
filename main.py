@@ -70,13 +70,15 @@ async def init_db():
         );
         """
     )
+    # History is now per chat: (user_id, chat_id) is the primary key
     await sql_db.execute(
         """
         CREATE TABLE IF NOT EXISTS history (
-            user_id TEXT PRIMARY KEY,
+            user_id TEXT,
+            chat_id INTEGER,
             first_added_at TEXT,
-            added_by TEXT,
-            reserved INTEGER DEFAULT 0
+            reserved INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, chat_id)
         );
         """
     )
@@ -121,72 +123,62 @@ async def clear_excluded_countries(chat_id):
     await sql_db.execute("DELETE FROM exclude WHERE chat_id = ?", (chat_id,))
     await sql_db.commit()
 
+# Reserve a user for a specific chat. Returns True if reserved, False if already reserved for that chat.
 async def reserve_user(user_id, chat_id):
     now = datetime.utcnow().isoformat()
     try:
         await sql_db.execute(
-            "INSERT INTO history(user_id, first_added_at, added_by, reserved) VALUES(?, ?, ?, 1)",
-            (user_id, now, f",{chat_id},"),
+            "INSERT INTO history(user_id, chat_id, first_added_at, reserved) VALUES(?, ?, ?, 1)",
+            (user_id, chat_id, now),
         )
         await sql_db.commit()
         return True
     except sqlite3.IntegrityError:
+        # Already present for this chat
+        # If row exists but reserved is 0, treat as not reserved (we don't reserve again)
         return False
 
+# Mark a user as added for a specific chat (clears reserved flag or inserts record if missing)
 async def mark_user_added(user_id, chat_id):
-    async with sql_db.execute("SELECT added_by FROM history WHERE user_id = ?", (user_id,)) as cur:
+    async with sql_db.execute("SELECT reserved FROM history WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cur:
         row = await cur.fetchone()
         if not row:
             now = datetime.utcnow().isoformat()
             await sql_db.execute(
-                "INSERT OR REPLACE INTO history(user_id, first_added_at, added_by, reserved) VALUES(?, ?, ?, 0)",
-                (user_id, now, f",{chat_id},"),
+                "INSERT OR REPLACE INTO history(user_id, chat_id, first_added_at, reserved) VALUES(?, ?, ?, 0)",
+                (user_id, chat_id, now),
             )
             await sql_db.commit()
             return
-        added_by = row[0] or ""
-        token = f",{chat_id},"
-        if token not in added_by:
-            new_added_by = added_by + str(chat_id) + "," if added_by else token
-            await sql_db.execute(
-                "UPDATE history SET added_by = ?, reserved = 0 WHERE user_id = ?",
-                (new_added_by, user_id),
-            )
-        else:
-            await sql_db.execute("UPDATE history SET reserved = 0 WHERE user_id = ?", (user_id,))
-        await sql_db.commit()
+    await sql_db.execute("UPDATE history SET reserved = 0 WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+    await sql_db.commit()
 
-async def unreserve_user_on_failure(user_id):
-    await sql_db.execute("DELETE FROM history WHERE user_id = ? AND reserved = 1", (user_id,))
+# Unreserve only for the specific chat
+async def unreserve_user_on_failure(user_id, chat_id):
+    await sql_db.execute("DELETE FROM history WHERE user_id = ? AND chat_id = ? AND reserved = 1", (user_id, chat_id))
     await sql_db.commit()
 
 async def history_for_chat(chat_id, limit=20):
-    token = f",{chat_id},"
     async with sql_db.execute(
-        "SELECT user_id, first_added_at FROM history WHERE added_by LIKE ? ORDER BY first_added_at DESC LIMIT ?",
-        (f"%{token}%", limit),
+        "SELECT user_id, first_added_at FROM history WHERE chat_id = ? ORDER BY first_added_at DESC LIMIT ?",
+        (chat_id, limit),
     ) as cur:
         rows = await cur.fetchall()
         return rows
 
 async def history_count_for_chat(chat_id):
-    token = f",{chat_id},"
-    async with sql_db.execute("SELECT COUNT(*) FROM history WHERE added_by LIKE ?", (f"%{token}%",)) as cur:
+    async with sql_db.execute("SELECT COUNT(*) FROM history WHERE chat_id = ?", (chat_id,)) as cur:
         row = await cur.fetchone()
         return row[0] if row else 0
 
+# Kept for compatibility but note: this returns total across all chats (not used in UI anymore)
 async def history_total_count():
     async with sql_db.execute("SELECT COUNT(*) FROM history") as cur:
         row = await cur.fetchone()
         return row[0] if row else 0
 
 async def clear_history_for_chat(chat_id):
-    token = f",{chat_id},"
-    await sql_db.execute(
-        "UPDATE history SET added_by = REPLACE(added_by, ?, '') WHERE added_by LIKE ?",
-        (token, f"%{token}%"),
-    )
-    await sql_db.execute("DELETE FROM history WHERE added_by IS NULL OR added_by = ''")
+    await sql_db.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
     await sql_db.commit()
 
 async def clear_all_history():
@@ -224,21 +216,21 @@ async def start_matching(chat_id, token, explore_url, stat_msg, task_id, keyboar
                         text = await res.text()
                         if res.status == 429 or "LikeExceeded" in text:
                             stop_reason = "LIMIT EXCEEDED"
-                            await unreserve_user_on_failure(user_id)
+                            await unreserve_user_on_failure(user_id, chat_id)
                             return False
                         if res.status == 401 or "AuthRequired" in text:
                             stop_reason = "TOKEN EXPIRED"
-                            await unreserve_user_on_failure(user_id)
+                            await unreserve_user_on_failure(user_id, chat_id)
                             return False
                         if res.status == 200:
                             await mark_user_added(user_id, chat_id)
                         else:
-                            await unreserve_user_on_failure(user_id)
+                            await unreserve_user_on_failure(user_id, chat_id)
                         return True
                 except Exception:
                     stats["errors"] += 1
                     try:
-                        await unreserve_user_on_failure(user_id)
+                        await unreserve_user_on_failure(user_id, chat_id)
                     except:
                         pass
                     return True
@@ -459,10 +451,10 @@ async def _hist_toggle(callback: CallbackQuery):
     current = await get_config_bool(f"history_enabled:{chat_id}", default=True)
     new = not current
     await set_config_bool(f"history_enabled:{chat_id}", new)
-    total = await history_total_count()
+    # Only show per-chat count now
     count = await history_count_for_chat(chat_id)
     state = "ON" if new else "OFF"
-    text = f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}"
+    text = f"History ({state}):\nYour saved ids: {count}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"{'ON' if new else 'OFF'}", callback_data=f"hist_toggle:{chat_id}"),
          InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
@@ -484,11 +476,11 @@ async def _hist_clear(callback: CallbackQuery):
     except:
         await callback.answer("Invalid chat id", show_alert=False)
         return
-    await clear_all_history()
+    # Clear only this chat's history
+    await clear_history_for_chat(chat_id)
     await set_config_bool(f"history_enabled:{chat_id}", True)
-    total = await history_total_count()
     count = await history_count_for_chat(chat_id)
-    text = f"History (ON):\nTotal saved ids: {total}\nYour saved ids: {count}"
+    text = f"History (ON):\nYour saved ids: {count}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ON", callback_data=f"hist_toggle:{chat_id}"),
          InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
@@ -497,7 +489,7 @@ async def _hist_clear(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=kb)
     except:
         pass
-    await callback.answer("Cleared all history.", show_alert=False)
+    await callback.answer("Cleared history for this chat.", show_alert=False)
 
 @dp.message(F.text.startswith("https://api.meeff.com/user/explore"))
 async def set_explore_url_direct(message):
@@ -540,7 +532,7 @@ async def history_cmd(message):
     parts = message.text.split(maxsplit=1)
     args = parts[1].strip() if len(parts) > 1 else ""
     if not args:
-        total = await history_total_count()
+        # Only show per-chat stats
         count = await history_count_for_chat(chat_id)
         enabled = await get_config_bool(f"history_enabled:{chat_id}", default=True)
         state = "ON" if enabled else "OFF"
@@ -548,7 +540,7 @@ async def history_cmd(message):
             [InlineKeyboardButton(text=f"{state}", callback_data=f"hist_toggle:{chat_id}"),
              InlineKeyboardButton(text="Clear", callback_data=f"hist_clear:{chat_id}")]
         ])
-        await message.answer(f"History ({state}):\nTotal saved ids: {total}\nYour saved ids: {count}", reply_markup=kb)
+        await message.answer(f"History ({state}):\nYour saved ids: {count}", reply_markup=kb)
         return
     if args.lower() == "clear":
         try:
