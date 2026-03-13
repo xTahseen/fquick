@@ -543,7 +543,8 @@ async def history_cmd(message):
 
 @dp.message(Command("restart"))
 async def restart_cmd(message):
-    await message.answer("Restarting...")
+    msg = await message.answer("Restarting...")
+
     for key, task in list(matching_tasks.items()):
         try:
             task.cancel()
@@ -551,6 +552,7 @@ async def restart_cmd(message):
             pass
     matching_tasks.clear()
     user_stats.clear()
+
     for tid, meta in list(task_meta.items()):
         try:
             meta["running"] = False
@@ -558,11 +560,13 @@ async def restart_cmd(message):
             pass
     task_meta.clear()
     user_tokens.clear()
+
     try:
         if sql_db:
             await sql_db.close()
     except:
         pass
+
     try:
         await bot.close()
     except:
@@ -571,7 +575,9 @@ async def restart_cmd(message):
                 await bot.session.close()
         except:
             pass
-    await message.answer("Restarted.")
+
+    await msg.edit_text("Restarted.")
+
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @dp.message(F.text)
