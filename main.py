@@ -51,6 +51,7 @@ ANSWER_URL = "https://api.meeff.com/user/undoableAnswer/v5/?userId={user_id}&isO
 
 async def init_db():
     global sql_db
+    # initialize a new aiosqlite connection and ensure tables exist
     sql_db = await aiosqlite.connect(SQLITE_PATH, timeout=30)
     await sql_db.execute("PRAGMA journal_mode=WAL;")
     await sql_db.execute("PRAGMA synchronous=NORMAL;")
@@ -84,12 +85,34 @@ async def init_db():
     )
     await sql_db.commit()
 
+async def ensure_db():
+    """
+    Ensure the global sql_db is initialized and active.
+    If the existing connection is closed or invalid, reinitialize it.
+    """
+    global sql_db
+    if sql_db is None:
+        await init_db()
+        return
+    try:
+        # probe the connection to ensure it's active
+        async with sql_db.execute("SELECT 1") as cur:
+            await cur.fetchone()
+    except (ValueError, sqlite3.ProgrammingError):
+        # no active connection or connection invalid -> re-init
+        await init_db()
+    except Exception:
+        # on any unexpected error, try to re-init as a recovery step
+        await init_db()
+
 async def get_config_value(key):
+    await ensure_db()
     async with sql_db.execute("SELECT value FROM config WHERE key = ?", (key,)) as cur:
         row = await cur.fetchone()
         return row[0] if row else None
 
 async def set_config_value(key, value):
+    await ensure_db()
     await sql_db.execute(
         "INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
@@ -97,20 +120,24 @@ async def set_config_value(key, value):
     await sql_db.commit()
 
 async def get_config_bool(key, default=False):
+    await ensure_db()
     v = await get_config_value(key)
     if v is None:
         return default
     return v == "1"
 
 async def set_config_bool(key, val):
+    await ensure_db()
     await set_config_value(key, "1" if val else "0")
 
 async def list_excluded_countries(chat_id):
+    await ensure_db()
     async with sql_db.execute("SELECT country FROM exclude WHERE chat_id = ?", (chat_id,)) as cur:
         rows = await cur.fetchall()
         return [r[0] for r in rows]
 
 async def add_excluded_countries(chat_id, countries):
+    await ensure_db()
     async with sql_db.execute("BEGIN"):
         for c in countries:
             await sql_db.execute(
@@ -120,10 +147,12 @@ async def add_excluded_countries(chat_id, countries):
     await sql_db.commit()
 
 async def clear_excluded_countries(chat_id):
+    await ensure_db()
     await sql_db.execute("DELETE FROM exclude WHERE chat_id = ?", (chat_id,))
     await sql_db.commit()
 
 async def reserve_user(user_id, chat_id):
+    await ensure_db()
     now = datetime.utcnow().isoformat()
     try:
         await sql_db.execute(
@@ -136,6 +165,7 @@ async def reserve_user(user_id, chat_id):
         return False
 
 async def mark_user_added(user_id, chat_id):
+    await ensure_db()
     async with sql_db.execute("SELECT reserved FROM history WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cur:
         row = await cur.fetchone()
         if not row:
@@ -150,10 +180,12 @@ async def mark_user_added(user_id, chat_id):
     await sql_db.commit()
 
 async def unreserve_user_on_failure(user_id, chat_id):
+    await ensure_db()
     await sql_db.execute("DELETE FROM history WHERE user_id = ? AND chat_id = ? AND reserved = 1", (user_id, chat_id))
     await sql_db.commit()
 
 async def history_for_chat(chat_id, limit=20):
+    await ensure_db()
     async with sql_db.execute(
         "SELECT user_id, first_added_at FROM history WHERE chat_id = ? ORDER BY first_added_at DESC LIMIT ?",
         (chat_id, limit),
@@ -162,20 +194,24 @@ async def history_for_chat(chat_id, limit=20):
         return rows
 
 async def history_count_for_chat(chat_id):
+    await ensure_db()
     async with sql_db.execute("SELECT COUNT(*) FROM history WHERE chat_id = ?", (chat_id,)) as cur:
         row = await cur.fetchone()
         return row[0] if row else 0
 
 async def history_total_count():
+    await ensure_db()
     async with sql_db.execute("SELECT COUNT(*) FROM history") as cur:
         row = await cur.fetchone()
         return row[0] if row else 0
 
 async def clear_history_for_chat(chat_id):
+    await ensure_db()
     await sql_db.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
     await sql_db.commit()
 
 async def clear_all_history():
+    await ensure_db()
     await sql_db.execute("DELETE FROM history")
     await sql_db.commit()
 
@@ -562,8 +598,11 @@ async def restart_cmd(message):
     user_tokens.clear()
 
     try:
+        global sql_db
         if sql_db:
             await sql_db.close()
+            # prevent reuse of a closed connection
+            sql_db = None
     except:
         pass
 
