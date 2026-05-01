@@ -684,12 +684,12 @@ async def fetch_tokens_from_mongo(user_id):
 async def sync_command(message):
     user_id = message.chat.id
     if not MONGO_URI:
-        await message.reply("MongoDB is not configured. Set MONGO_URI environment variable to use /sync.")
+        await message.reply("MongoDB is not configured.")
         return
     try:
         db = get_mongo_db()
         if db is None:
-            await message.reply("Failed to connect to MongoDB using MONGO_URI. Check configuration.")
+            await message.reply("Failed to connect to MongoDB.")
             return
     except Exception as e:
         await message.reply(f"MongoDB connection error: {e}")
@@ -701,7 +701,7 @@ async def sync_command(message):
         if docs_str:
             docs = docs_str
         else:
-            await message.reply("No tokens found for your account in the MongoDB database.\nIf your second bot stores user_id as a different type, let me know and I can try matching both types.")
+            await message.reply("No tokens found.")
             return
     tokens = [d.get("token") for d in docs if d.get("token")]
     names = [d.get("name") or "(unnamed)" for d in docs]
@@ -853,7 +853,7 @@ async def register_bot_commands():
         BotCommand(command="countries", description="Manage countries filter"),
         BotCommand(command="history", description="Show history stats"),
         BotCommand(command="restart", description="Restart the bot"),
-        BotCommand(command="sync", description="Sync tokens from shared MongoDB and start requests"),
+        BotCommand(command="sync", description="Sync tokens from shared MongoDB"),
     ]
     await bot.set_my_commands(commands)
 
